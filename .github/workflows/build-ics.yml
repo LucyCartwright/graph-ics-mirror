@@ -1,9 +1,15 @@
 name: Build ICS from Microsoft Graph
 
 on:
+  # Change */10 to */5 if you want every 5 minutes
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes
+    - cron: "*/10 * * * *"
   workflow_dispatch:
+
+# Avoid overlapping runs
+concurrency:
+  group: graph-ics-mirror
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -11,6 +17,15 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      # Tweak these if you like
+      PAST_DAYS: "30"          # how many days back to include
+      FUTURE_DAYS: "180"       # how many days ahead to include
+      CAL_NAME: "Work (Graph)" # Google will show this name
+      MASK_PRIVATE: "false"    # set "true" to export private events as "Busy"
+      IANA_TZ: "Europe/London" # display timezone hint in ICS
+
     steps:
       - uses: actions/checkout@v4
 
@@ -24,11 +39,38 @@ jobs:
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
           CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
           USER_UPN: ${{ secrets.USER_UPN }}
+          PAST_DAYS: ${{ env.PAST_DAYS }}
+          FUTURE_DAYS: ${{ env.FUTURE_DAYS }}
+          CAL_NAME: ${{ env.CAL_NAME }}
+          MASK_PRIVATE: ${{ env.MASK_PRIVATE }}
+          IANA_TZ: ${{ env.IANA_TZ }}
         run: |
           cat > build-ics.js <<'EOF'
           const fs = require('fs');
 
-          const { TENANT_ID, CLIENT_ID, CLIENT_SECRET, USER_UPN } = process.env;
+          const {
+            TENANT_ID, CLIENT_ID, CLIENT_SECRET, USER_UPN,
+            PAST_DAYS = '30', FUTURE_DAYS = '180',
+            CAL_NAME = 'Work (Graph)', MASK_PRIVATE = 'false', IANA_TZ = 'Europe/London'
+          } = process.env;
+
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+          async function fetchWithRetry(url, opts, ok=[200], max=5) {
+            let delay = 1000;
+            for (let i = 1; i <= max; i++) {
+              const res = await fetch(url, opts);
+              if (ok.includes(res.status)) return res;
+              if (![429,500,502,503,504].includes(res.status) || i === max) {
+                const txt = await res.text().catch(()=> '');
+                throw new Error(`HTTP ${res.status} ${res.statusText} – ${txt.slice(0,200)}`);
+              }
+              const ra = res.headers.get('retry-after');
+              const wait = ra ? (parseInt(ra,10) * 1000) : delay;
+              await sleep(wait + Math.floor(Math.random()*250));
+              delay = Math.min(delay * 2, 8000);
+            }
+          }
 
           async function getToken() {
             const body = new URLSearchParams({
@@ -37,13 +79,11 @@ jobs:
               client_secret: CLIENT_SECRET,
               scope: 'https://graph.microsoft.com/.default'
             });
-            const r = await fetch(`https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-              body
-            });
-            if (!r.ok) throw new Error(`Token HTTP ${r.status}`);
-            return r.json();
+            const res = await fetchWithRetry(
+              `https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token`,
+              { method:'POST', headers:{ 'Content-Type':'application/x-www-form-urlencoded' }, body }
+            );
+            return res.json();
           }
 
           function icsEscape(s) {
@@ -57,10 +97,10 @@ jobs:
 
           function toUtcStamp(iso) {
             const d = new Date(iso.endsWith('Z') ? iso : iso + 'Z');
-            const pad = n => String(n).padStart(2,'0');
+            const pad = n => String(n).padStart(2, '0');
             return (
               d.getUTCFullYear() +
-              pad(d.getUTCMonth()+1) +
+              pad(d.getUTCMonth() + 1) +
               pad(d.getUTCDate()) + 'T' +
               pad(d.getUTCHours()) +
               pad(d.getUTCMinutes()) +
@@ -70,21 +110,22 @@ jobs:
 
           async function fetchEvents(accessToken) {
             const now = new Date();
-            const start = new Date(now.getTime() - 90*24*3600*1000);   // past 90 days
-            const end   = new Date(now.getTime() + 365*24*3600*1000);  // next year
+            const start = new Date(now.getTime() - parseInt(PAST_DAYS,10)*24*3600*1000);
+            const end   = new Date(now.getTime() + parseInt(FUTURE_DAYS,10)*24*3600*1000);
+
             const headers = {
               'Authorization': `Bearer ${accessToken}`,
               'Prefer': 'outlook.timezone="UTC"'
             };
-            let url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(USER_UPN)}` +
-                      `/calendarView?startDateTime=${start.toISOString()}&endDateTime=${end.toISOString()}` +
-                      `&$top=1000`;
-            let all = [];
+
+            let url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(USER_UPN)}`
+                    + `/calendarView?startDateTime=${start.toISOString()}&endDateTime=${end.toISOString()}&$top=1000`;
+
+            const all = [];
             while (url) {
-              const r = await fetch(url, { headers });
-              if (!r.ok) throw new Error(`Graph HTTP ${r.status}`);
-              const j = await r.json();
-              all = all.concat(j.value || []);
+              const res = await fetchWithRetry(url, { headers });
+              const j = await res.json();
+              all.push(...(j.value || []));
               url = j['@odata.nextLink'] || null;
             }
             return all;
@@ -92,32 +133,44 @@ jobs:
 
           function buildICS(events) {
             const nowStamp = toUtcStamp(new Date().toISOString());
-            const L = [];
-            L.push('BEGIN:VCALENDAR');
-            L.push('PRODID:-//Calendar Mirror//EN');
-            L.push('VERSION:2.0');
-            L.push('CALSCALE:GREGORIAN');
-            L.push('METHOD:PUBLISH');
-            L.push('X-WR-CALNAME:Work (Graph)');
-            L.push('X-WR-TIMEZONE:Europe/London');
+            const L = [
+              'BEGIN:VCALENDAR',
+              'PRODID:-//Calendar Mirror//EN',
+              'VERSION:2.0',
+              'CALSCALE:GREGORIAN',
+              'METHOD:PUBLISH',
+              `X-WR-CALNAME:${icsEscape(CAL_NAME)}`,
+              `X-WR-TIMEZONE:${icsEscape(IANA_TZ)}`,
+              `X-REFRESHED-AT:${nowStamp}`
+            ];
+
+            const mask = (MASK_PRIVATE || '').toLowerCase() === 'true';
 
             for (const ev of events) {
               const uid = (ev.id || Math.random().toString(36).slice(2)) + '@graph.microsoft.com';
-              const summary = icsEscape(ev.subject || '(No title)');
-              const desc = icsEscape(ev.bodyPreview || '');
-              const location = icsEscape(ev.location?.displayName || '');
-              const showAs = (ev.showAs || '').toLowerCase();
-              const transp = showAs === 'free' ? 'TRANSPARENT' : 'OPAQUE';
+              const isPrivate = (ev.sensitivity || '').toLowerCase() === 'private';
               const isAllDay = !!ev.isAllDay;
-
               const dtStart = ev.start?.dateTime;
               const dtEnd   = ev.end?.dateTime;
               if (!dtStart || !dtEnd) continue;
 
+              let summary = ev.subject || '(No title)';
+              let desc = ev.bodyPreview || '';
+              let location = ev.location?.displayName || '';
+
+              if (mask && isPrivate) {
+                summary = 'Busy';
+                desc = '';
+                location = '';
+              }
+
+              const showAs = (ev.showAs || '').toLowerCase();
+              const transp = showAs === 'free' ? 'TRANSPARENT' : 'OPAQUE';
+
               L.push('BEGIN:VEVENT');
               L.push(`UID:${uid}`);
               L.push(`DTSTAMP:${nowStamp}`);
-              L.push(`SUMMARY:${summary}`);
+              L.push(`SUMMARY:${icsEscape(summary)}`);
 
               if (isAllDay) {
                 const d1 = dtStart.slice(0,10).replace(/-/g,'');
@@ -129,24 +182,24 @@ jobs:
                 L.push(`DTEND:${toUtcStamp(dtEnd)}`);
               }
 
-              if (location) L.push(`LOCATION:${location}`);
-              if (desc)     L.push(`DESCRIPTION:${desc}`);
+              if (location) L.push(`LOCATION:${icsEscape(location)}`);
+              if (desc)     L.push(`DESCRIPTION:${icsEscape(desc)}`);
               L.push('STATUS:CONFIRMED');
               L.push(`TRANSP:${transp}`);
               L.push('END:VEVENT');
             }
 
             L.push('END:VCALENDAR');
-            return L.join('\r\n') + '\r\n';
+            return L.join('\r\n') + '\r\n'; // CRLF line endings
           }
 
           (async () => {
             const tok = await getToken();
             const events = await fetchEvents(tok.access_token);
             const ics = buildICS(events);
-            require('fs').writeFileSync('calendar.ics', ics, 'utf8');
+            fs.writeFileSync('calendar.ics', ics, 'utf8');
             console.log(`Built calendar.ics with ${events.length} events`);
-          })().catch(e => { console.error(e); process.exit(1); });
+          })().catch(e => { console.error(e.message || e); process.exit(1); });
           EOF
 
           node build-ics.js
@@ -155,6 +208,7 @@ jobs:
         run: |
           git config user.name "graph-ics-bot"
           git config user.email "bot@example.com"
+          now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
           git add calendar.ics
-          git commit -m "Update calendar.ics" || echo "No changes"
+          git commit -m "Update calendar.ics ${now}" || echo "No changes"
           git push
