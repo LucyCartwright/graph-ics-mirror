@@ -70,8 +70,8 @@ jobs:
 
           async function fetchEvents(accessToken) {
             const now = new Date();
-            const start = new Date(now.getTime() - 30*24*3600*1000);   // past 30 days
-            const end   = new Date(now.getTime() + 180*24*3600*1000);  // next 6 months
+            const start = new Date(now.getTime() - 90*24*3600*1000);   // past 90 days
+            const end   = new Date(now.getTime() + 365*24*3600*1000);  // next year
             const headers = {
               'Authorization': `Bearer ${accessToken}`,
               'Prefer': 'outlook.timezone="UTC"'
